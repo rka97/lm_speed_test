@@ -241,6 +241,25 @@ def create_train_state(rng, model, learning_rate, input_shape, mesh):
     return state
 
 
+def create_component_state(rng, model, learning_rate, input_shape, mesh):
+    """Creates initial TrainState for component modules (takes float input)."""
+    dummy_input = jnp.ones(input_shape, dtype=jnp.float32)
+    params = model.init(rng, dummy_input)
+    tx = optax.adamw(learning_rate)
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+    )
+    
+    replicate_sharding = NamedSharding(mesh, P())
+    state = jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, replicate_sharding),
+        state
+    )
+    return state
+
+
 def compute_loss(params, apply_fn, batch, targets):
     """Compute cross-entropy loss."""
     logits = apply_fn(params, batch)
@@ -252,6 +271,11 @@ def compute_loss(params, apply_fn, batch, targets):
     targets_flat = targets.reshape(-1)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits_flat, targets_flat)
     return jnp.mean(loss)
+
+
+def compute_component_loss(params, apply_fn, batch):
+    output = apply_fn(params, batch)
+    return jnp.mean(output ** 2)
 
 
 def create_sharded_train_step(mesh, apply_fn):
@@ -269,6 +293,25 @@ def create_sharded_train_step(mesh, apply_fn):
         
         def loss_fn(params):
             return compute_loss(params, apply_fn, batch, targets)
+        
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+        state = state.apply_gradients(grads=grads)
+        return state, loss
+    
+    return train_step
+
+
+def create_sharded_component_train_step(mesh, apply_fn):
+    """Create a sharded training step function for components."""
+    data_sharding = NamedSharding(mesh, P('data'))
+    replicate_sharding = NamedSharding(mesh, P())
+    
+    @partial(jax.jit, in_shardings=(replicate_sharding, data_sharding),
+             out_shardings=(replicate_sharding, replicate_sharding))
+    def train_step(state, batch):
+        """Training step for components."""
+        def loss_fn(params):
+            return compute_component_loss(params, apply_fn, batch)
         
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         state = state.apply_gradients(grads=grads)
@@ -296,6 +339,97 @@ def shard_batch(batch, mesh):
     """Shard a batch across the data dimension."""
     data_sharding = NamedSharding(mesh, P('data'))
     return jax.device_put(batch, data_sharding)
+
+
+def benchmark_component(component_name, model, cfg, total_batch_size, num_warmup, 
+                        num_iterations, mesh, rng):
+    """Benchmark a single component (Mlp, CausalAttn, or TBlock)."""
+    print(f"\n--- {component_name} Benchmark ---")
+    
+    # Create input shape for component (float input, not token ids)
+    input_shape = (total_batch_size, cfg.seq_len, cfg.model_dim)
+    
+    # Initialize component
+    with mesh:
+        state = create_component_state(rng, model, learning_rate=1e-4, 
+                                       input_shape=input_shape, mesh=mesh)
+    
+    # Count parameters
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
+    print(f"  Parameters: {param_count:,}")
+    
+    # Generate synthetic data
+    data_rng = jax.random.PRNGKey(456)
+    batch = jax.random.normal(data_rng, shape=input_shape, dtype=jnp.float32)
+    batch = shard_batch(batch, mesh)
+    
+    # Create sharded functions
+    with mesh:
+        forward_fn = create_sharded_forward(mesh, model.apply)
+        train_step_fn = create_sharded_component_train_step(mesh, model.apply)
+    
+    # Forward-only benchmark
+    print(f"  Running {num_warmup} warmup iterations (forward)...")
+    with mesh:
+        for _ in range(num_warmup):
+            output = forward_fn(state.params, batch)
+            output.block_until_ready()
+    
+    print(f"  Running {num_iterations} benchmark iterations (forward)...")
+    forward_times = []
+    with mesh:
+        for _ in range(num_iterations):
+            start = time.perf_counter()
+            output = forward_fn(state.params, batch)
+            output.block_until_ready()
+            end = time.perf_counter()
+            forward_times.append(end - start)
+    
+    avg_forward_time = sum(forward_times) / len(forward_times)
+    min_forward_time = min(forward_times)
+    max_forward_time = max(forward_times)
+    print(f"  Avg forward time: {avg_forward_time*1000:.2f} ms")
+    
+    # Forward + Backward benchmark
+    print(f"  Running {num_warmup} warmup iterations (forward+backward)...")
+    with mesh:
+        for _ in range(num_warmup):
+            state, loss = train_step_fn(state, batch)
+            loss.block_until_ready()
+    
+    print(f"  Running {num_iterations} benchmark iterations (forward+backward)...")
+    fwd_bwd_times = []
+    with mesh:
+        for _ in range(num_iterations):
+            start = time.perf_counter()
+            state, loss = train_step_fn(state, batch)
+            loss.block_until_ready()
+            end = time.perf_counter()
+            fwd_bwd_times.append(end - start)
+    
+    avg_fwd_bwd_time = sum(fwd_bwd_times) / len(fwd_bwd_times)
+    min_fwd_bwd_time = min(fwd_bwd_times)
+    max_fwd_bwd_time = max(fwd_bwd_times)
+    print(f"  Avg forward+backward time: {avg_fwd_bwd_time*1000:.2f} ms")
+    
+    # Calculate throughput
+    tokens_per_batch = total_batch_size * cfg.seq_len
+    forward_throughput = tokens_per_batch / avg_forward_time
+    fwd_bwd_throughput = tokens_per_batch / avg_fwd_bwd_time
+    print(f"  Forward throughput: {forward_throughput:,.0f} tokens/sec")
+    print(f"  Forward+Backward throughput: {fwd_bwd_throughput:,.0f} tokens/sec")
+    
+    return {
+        f'{component_name}_num_params': param_count,
+        f'{component_name}_avg_forward_time_ms': avg_forward_time * 1000,
+        f'{component_name}_min_forward_time_ms': min_forward_time * 1000,
+        f'{component_name}_max_forward_time_ms': max_forward_time * 1000,
+        f'{component_name}_avg_fwd_bwd_time_ms': avg_fwd_bwd_time * 1000,
+        f'{component_name}_min_fwd_bwd_time_ms': min_fwd_bwd_time * 1000,
+        f'{component_name}_max_fwd_bwd_time_ms': max_fwd_bwd_time * 1000,
+        f'{component_name}_forward_throughput_tokens_sec': forward_throughput,
+        f'{component_name}_fwd_bwd_throughput_tokens_sec': fwd_bwd_throughput,
+    }
 
 
 def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file, num_devices=None):
@@ -423,6 +557,34 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file, num_
     print(f"\n  Forward throughput: {forward_throughput:,.0f} tokens/sec")
     print(f"  Forward+Backward throughput: {fwd_bwd_throughput:,.0f} tokens/sec")
     
+    # ============== Component Benchmarks ==============
+    print(f"\n{'='*60}")
+    print("Component-Level Benchmarks")
+    print(f"{'='*60}")
+    
+    component_results = {}
+    
+    # Benchmark Mlp
+    mlp_model = Mlp(cfg)
+    mlp_rng = jax.random.PRNGKey(100)
+    mlp_results = benchmark_component('Mlp', mlp_model, cfg, total_batch_size, 
+                                      num_warmup, num_iterations, mesh, mlp_rng)
+    component_results.update(mlp_results)
+    
+    # Benchmark CausalAttn
+    attn_model = CausalAttn(cfg)
+    attn_rng = jax.random.PRNGKey(200)
+    attn_results = benchmark_component('CausalAttn', attn_model, cfg, total_batch_size,
+                                       num_warmup, num_iterations, mesh, attn_rng)
+    component_results.update(attn_results)
+    
+    # Benchmark TBlock
+    block_model = TBlock(cfg)
+    block_rng = jax.random.PRNGKey(300)
+    block_results = benchmark_component('TBlock', block_model, cfg, total_batch_size,
+                                        num_warmup, num_iterations, mesh, block_rng)
+    component_results.update(block_results)
+    
     # Save results to CSV
     results = {
         'framework': 'JAX_DataParallel',
@@ -446,6 +608,9 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file, num_
         'forward_throughput_tokens_sec': forward_throughput,
         'fwd_bwd_throughput_tokens_sec': fwd_bwd_throughput,
     }
+    
+    # Add component results
+    results.update(component_results)
     
     with open(output_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=results.keys())

@@ -15,7 +15,7 @@ import csv
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
 import torch
 import torch.nn.functional as F
@@ -85,6 +85,7 @@ class Attention(nn.Module):
         self.dim = cfg.model_dim
         self.n_heads = cfg.num_heads
         self.head_dim = cfg.model_dim // cfg.num_heads
+        self.seq_len = cfg.seq_len
 
         self.w_qkv = nn.Linear(cfg.model_dim, 3 * cfg.model_dim, bias=False)
         self.w_out = nn.Linear(cfg.model_dim, cfg.model_dim, bias=False)
@@ -97,9 +98,20 @@ class Attention(nn.Module):
         seq_len = cfg.seq_len
         attn_scale0 = math.log2(seq_len**2 - seq_len)
         self.attn_scale = nn.Parameter(torch.tensor(attn_scale0))
+        
+        # Pre-compute freqs_cis for standalone usage
+        self.register_buffer(
+            'freqs_cis',
+            precompute_freqs_cis(self.head_dim, cfg.seq_len, 500000)[0:cfg.seq_len],
+            persistent=False,
+        )
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis=None):
         bsz, seqlen, d = x.shape
+        
+        # Use provided freqs_cis or fall back to self.freqs_cis
+        if freqs_cis is None:
+            freqs_cis = self.freqs_cis[:, :seqlen, :].to(x.device)
 
         q, k, v = self.w_qkv(x).split(d, dim=2)
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
@@ -135,7 +147,7 @@ class Block(nn.Module):
         self.mlp_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon)
         self.layer_id = layer_id
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis=None):
         x = x + self.attn(self.attn_norm(x), freqs_cis)
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -235,6 +247,129 @@ def cleanup_distributed():
     """Clean up distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def benchmark_component(component_name: str, model: nn.Module, cfg: ModelConfig,
+                       batch_size: int, num_warmup: int, num_iterations: int,
+                       device: torch.device, world_size: int, local_rank: int,
+                       is_main: bool) -> Dict[str, Any]:
+    """Benchmark a single component (MLP, Attention, or Block)."""
+    if is_main:
+        print(f"\n--- {component_name} Benchmark ---")
+    
+    model = model.to(device)
+    #model = torch.compile(model, fullgraph=True, mode='max-autotune', dynamic=False)
+    model = torch.compile(model, fullgraph=True)
+    
+    # Count parameters before wrapping with DDP
+    param_count = sum(p.numel() for p in model.parameters())
+    
+    # Wrap with DDP if distributed
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    
+    if is_main:
+        print(f"  Parameters: {param_count:,}")
+    
+    # Create optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    
+    # Generate synthetic data (float input for components)
+    torch.manual_seed(456 + local_rank)
+    batch = torch.randn(batch_size, cfg.seq_len, cfg.model_dim, device=device)
+    
+    # ============== Forward-only benchmark ==============
+    model.eval()
+    
+    if is_main:
+        print(f"  Running {num_warmup} warmup iterations (forward)...")
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            output = model(batch)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+    
+    if is_main:
+        print(f"  Running {num_iterations} benchmark iterations (forward)...")
+    forward_times = []
+    with torch.no_grad():
+        for _ in range(num_iterations):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+            output = model(batch)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end = time.perf_counter()
+            forward_times.append(end - start)
+    
+    avg_forward_time = sum(forward_times) / len(forward_times)
+    min_forward_time = min(forward_times)
+    max_forward_time = max(forward_times)
+    
+    if is_main:
+        print(f"  Avg forward time: {avg_forward_time*1000:.2f} ms")
+    
+    # ============== Forward + Backward benchmark ==============
+    model.train()
+    
+    @torch.compile
+    def _component_step(batch):
+        optimizer.zero_grad()
+        output = model(batch)
+        # Simple MSE loss to enable gradient computation
+        loss = (output ** 2).mean()
+        loss.backward()
+        optimizer.step()
+        return loss
+    
+    if is_main:
+        print(f"  Running {num_warmup} warmup iterations (forward+backward)...")
+    for _ in range(num_warmup):
+        _component_step(batch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    
+    if is_main:
+        print(f"  Running {num_iterations} benchmark iterations (forward+backward)...")
+    fwd_bwd_times = []
+    for _ in range(num_iterations):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        _component_step(batch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end = time.perf_counter()
+        fwd_bwd_times.append(end - start)
+    
+    avg_fwd_bwd_time = sum(fwd_bwd_times) / len(fwd_bwd_times)
+    min_fwd_bwd_time = min(fwd_bwd_times)
+    max_fwd_bwd_time = max(fwd_bwd_times)
+    
+    if is_main:
+        print(f"  Avg forward+backward time: {avg_fwd_bwd_time*1000:.2f} ms")
+    
+    # Calculate throughput
+    tokens_per_batch = batch_size * cfg.seq_len * world_size
+    forward_throughput = tokens_per_batch / avg_forward_time
+    fwd_bwd_throughput = tokens_per_batch / avg_fwd_bwd_time
+    
+    if is_main:
+        print(f"  Forward throughput: {forward_throughput:,.0f} tokens/sec")
+        print(f"  Forward+Backward throughput: {fwd_bwd_throughput:,.0f} tokens/sec")
+    
+    return {
+        f'{component_name}_num_params': param_count,
+        f'{component_name}_avg_forward_time_ms': avg_forward_time * 1000,
+        f'{component_name}_min_forward_time_ms': min_forward_time * 1000,
+        f'{component_name}_max_forward_time_ms': max_forward_time * 1000,
+        f'{component_name}_avg_fwd_bwd_time_ms': avg_fwd_bwd_time * 1000,
+        f'{component_name}_min_fwd_bwd_time_ms': min_fwd_bwd_time * 1000,
+        f'{component_name}_max_fwd_bwd_time_ms': max_fwd_bwd_time * 1000,
+        f'{component_name}_forward_throughput_tokens_sec': forward_throughput,
+        f'{component_name}_fwd_bwd_throughput_tokens_sec': fwd_bwd_throughput,
+    }
 
 
 def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
@@ -388,6 +523,36 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
         print(f"\n  Forward throughput: {forward_throughput:,.0f} tokens/sec")
         print(f"  Forward+Backward throughput: {fwd_bwd_throughput:,.0f} tokens/sec")
     
+    # ============== Component Benchmarks ==============
+    if is_main:
+        print(f"\n{'='*60}")
+        print("Component-Level Benchmarks")
+        print(f"{'='*60}")
+    
+    component_results = {}
+    
+    # Benchmark MLP
+    mlp_model = MLP(
+        dim=cfg.model_dim,
+        hidden_dim=cfg.expanded_model_dim,
+        multiple_of=cfg.multiple_of,
+    )
+    mlp_results = benchmark_component('MLP', mlp_model, cfg, batch_size, num_warmup,
+                                      num_iterations, device, world_size, local_rank, is_main)
+    component_results.update(mlp_results)
+    
+    # Benchmark Attention
+    attn_model = Attention(cfg)
+    attn_results = benchmark_component('Attention', attn_model, cfg, batch_size, num_warmup,
+                                       num_iterations, device, world_size, local_rank, is_main)
+    component_results.update(attn_results)
+    
+    # Benchmark Block
+    block_model = Block(layer_id=0, cfg=cfg)
+    block_results = benchmark_component('Block', block_model, cfg, batch_size, num_warmup,
+                                        num_iterations, device, world_size, local_rank, is_main)
+    component_results.update(block_results)
+    
     # Save results to CSV (only main process)
     if is_main:
         results = {
@@ -412,6 +577,9 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
             'forward_throughput_tokens_sec': forward_throughput,
             'fwd_bwd_throughput_tokens_sec': fwd_bwd_throughput,
         }
+        
+        # Add component results
+        results.update(component_results)
         
         with open(output_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=results.keys())

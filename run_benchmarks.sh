@@ -47,6 +47,13 @@ echo "  Benchmark Iters:    $NUM_ITERATIONS"
 echo "  Number of GPUs:     $NUM_GPUS"
 echo ""
 
+echo -e "${YELLOW}Benchmarks to run:${NC}"
+echo "  - Full Transformer Model"
+echo "  - MLP / Mlp component"
+echo "  - Attention / CausalAttn component"
+echo "  - Block / TBlock component"
+echo ""
+
 # Common arguments
 COMMON_ARGS="--model_dim $MODEL_DIM --num_heads $NUM_HEADS --seq_len $SEQ_LEN \
     --num_layers $NUM_LAYERS --vocab_size $VOCAB_SIZE --batch_size $BATCH_SIZE \

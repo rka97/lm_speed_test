@@ -1,232 +1,232 @@
 """
-Benchmark Results Comparison Script
-
-Reads JAX and PyTorch benchmark CSV files and prints a comparison table.
+Compare JAX and PyTorch DDP benchmark results.
 """
 
 import csv
 import argparse
-import os
-from typing import Dict, Any, Optional
+import sys
 
 
-def read_csv_results(filepath: str) -> Optional[Dict[str, Any]]:
-    """Read benchmark results from CSV file."""
-    if not os.path.exists(filepath):
-        print(f"Warning: File not found: {filepath}")
+def load_results(filepath):
+    """Load benchmark results from CSV file."""
+    if not filepath:
         return None
-    
-    with open(filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        results = next(reader, None)
-    
-    if results is None:
-        print(f"Warning: No data in file: {filepath}")
+    try:
+        with open(filepath, 'r') as f:
+            reader = csv.DictReader(f)
+            results = next(reader)
+            # Convert numeric fields
+            for key in results:
+                try:
+                    if '.' in results[key]:
+                        results[key] = float(results[key])
+                    else:
+                        results[key] = int(results[key])
+                except (ValueError, TypeError):
+                    pass
+            return results
+    except FileNotFoundError:
+        print(f"Warning: Could not find file {filepath}")
         return None
-    
-    # Convert numeric values
-    numeric_keys = [
-        'model_dim', 'num_heads', 'seq_len', 'num_layers', 'vocab_size',
-        'batch_size', 'num_params', 'num_devices', 'num_iterations',
-        'avg_forward_time_ms', 'min_forward_time_ms', 'max_forward_time_ms',
-        'avg_fwd_bwd_time_ms', 'min_fwd_bwd_time_ms', 'max_fwd_bwd_time_ms',
-        'forward_throughput_tokens_sec', 'fwd_bwd_throughput_tokens_sec'
-    ]
-    
-    for key in numeric_keys:
-        if key in results:
-            try:
-                results[key] = float(results[key])
-            except (ValueError, TypeError):
-                pass
-    
-    return results
+    except StopIteration:
+        print(f"Warning: File {filepath} is empty")
+        return None
 
 
-def format_number(n: float, precision: int = 2) -> str:
-    """Format number with commas and precision."""
-    if abs(n) >= 1000000:
-        return f"{n/1000000:,.{precision}f}M"
-    elif abs(n) >= 1000:
-        return f"{n/1000:,.{precision}f}K"
+def format_speedup(jax_val, pytorch_val):
+    """Format speedup ratio with direction indicator."""
+    if jax_val is None or pytorch_val is None:
+        return "N/A"
+    if pytorch_val == 0:
+        return "N/A"
+    ratio = jax_val / pytorch_val
+    if ratio > 1:
+        return f"{ratio:.2f}x (PyTorch faster)"
     else:
-        return f"{n:,.{precision}f}"
+        return f"{1/ratio:.2f}x (JAX faster)"
 
 
-def print_comparison_table(jax_results: Optional[Dict], pytorch_results: Optional[Dict]):
-    """Print a nicely formatted comparison table."""
+def format_throughput_comparison(jax_val, pytorch_val):
+    """Format throughput comparison with direction indicator."""
+    if jax_val is None or pytorch_val is None:
+        return "N/A"
+    if jax_val == 0:
+        return "N/A"
+    ratio = pytorch_val / jax_val
+    if ratio > 1:
+        return f"{ratio:.2f}x (PyTorch higher)"
+    else:
+        return f"{1/ratio:.2f}x (JAX higher)"
+
+
+def print_section(title, width=70):
+    """Print a section header."""
+    print(f"\n{'='*width}")
+    print(f" {title}")
+    print(f"{'='*width}")
+
+
+def print_comparison_row(label, jax_val, pytorch_val, unit="", comparison_fn=None):
+    """Print a comparison row."""
+    jax_str = f"{jax_val:,.2f}" if isinstance(jax_val, float) else (f"{jax_val:,}" if jax_val is not None else "N/A")
+    pytorch_str = f"{pytorch_val:,.2f}" if isinstance(pytorch_val, float) else (f"{pytorch_val:,}" if pytorch_val is not None else "N/A")
     
-    print("\n" + "=" * 80)
-    print("  TRANSFORMER BENCHMARK COMPARISON: JAX vs PyTorch DDP")
-    print("=" * 80)
+    if unit:
+        jax_str += f" {unit}"
+        pytorch_str += f" {unit}"
     
-    # Check if we have results to compare
+    comparison = ""
+    if comparison_fn and jax_val is not None and pytorch_val is not None:
+        comparison = comparison_fn(jax_val, pytorch_val)
+    
+    print(f"  {label:40s} | {jax_str:>18s} | {pytorch_str:>18s} | {comparison}")
+
+
+def compare_results(jax_file, pytorch_file):
+    """Compare JAX and PyTorch benchmark results."""
+    jax_results = load_results(jax_file)
+    pytorch_results = load_results(pytorch_file)
+    
     if jax_results is None and pytorch_results is None:
-        print("\nNo benchmark results available!")
-        return
+        print("Error: No results to compare!")
+        sys.exit(1)
     
-    # Use whichever results are available for config info
-    config_source = jax_results or pytorch_results
+    print("\n" + "="*90)
+    print(" "*30 + "BENCHMARK COMPARISON")
+    print("="*90)
     
-    # Print configuration
-    print("\n┌" + "─" * 78 + "┐")
-    print("│" + " MODEL CONFIGURATION".center(78) + "│")
-    print("├" + "─" * 78 + "┤")
+    # Configuration comparison
+    print_section("Configuration")
+    print(f"  {'Parameter':<40s} | {'JAX':>18s} | {'PyTorch':>18s}")
+    print(f"  {'-'*40} | {'-'*18} | {'-'*18}")
     
-    config_items = [
-        ("Model Dimension", config_source.get('model_dim', 'N/A')),
-        ("Number of Heads", config_source.get('num_heads', 'N/A')),
-        ("Sequence Length", config_source.get('seq_len', 'N/A')),
-        ("Number of Layers", config_source.get('num_layers', 'N/A')),
-        ("Vocabulary Size", format_number(config_source.get('vocab_size', 0), 0)),
-        ("Parameters", format_number(config_source.get('num_params', 0), 2)),
+    config_keys = ['model_dim', 'num_heads', 'seq_len', 'num_layers', 'vocab_size', 
+                   'batch_size', 'num_params', 'num_devices']
+    
+    for key in config_keys:
+        jax_val = jax_results.get(key) if jax_results else None
+        pytorch_val = pytorch_results.get(key) if pytorch_results else None
+        print_comparison_row(key, jax_val, pytorch_val)
+    
+    # Device info
+    jax_device = jax_results.get('device_type', 'N/A') if jax_results else 'N/A'
+    pytorch_device = pytorch_results.get('device_type', 'N/A') if pytorch_results else 'N/A'
+    print(f"  {'device_type':<40s} | {str(jax_device):>18s} | {str(pytorch_device):>18s}")
+    
+    # Full Model Performance comparison
+    print_section("Full Model Performance")
+    print(f"  {'Metric':<40s} | {'JAX':>18s} | {'PyTorch':>18s} | Comparison")
+    print(f"  {'-'*40} | {'-'*18} | {'-'*18} | {'-'*25}")
+    
+    # Forward pass
+    jax_fwd = jax_results.get('avg_forward_time_ms') if jax_results else None
+    pytorch_fwd = pytorch_results.get('avg_forward_time_ms') if pytorch_results else None
+    print_comparison_row("Avg Forward Time", jax_fwd, pytorch_fwd, "ms", format_speedup)
+    
+    # Forward+Backward pass
+    jax_fwd_bwd = jax_results.get('avg_fwd_bwd_time_ms') if jax_results else None
+    pytorch_fwd_bwd = pytorch_results.get('avg_fwd_bwd_time_ms') if pytorch_results else None
+    print_comparison_row("Avg Forward+Backward Time", jax_fwd_bwd, pytorch_fwd_bwd, "ms", format_speedup)
+    
+    # Throughput
+    jax_fwd_tput = jax_results.get('forward_throughput_tokens_sec') if jax_results else None
+    pytorch_fwd_tput = pytorch_results.get('forward_throughput_tokens_sec') if pytorch_results else None
+    print_comparison_row("Forward Throughput", jax_fwd_tput, pytorch_fwd_tput, "tok/s", format_throughput_comparison)
+    
+    jax_fwd_bwd_tput = jax_results.get('fwd_bwd_throughput_tokens_sec') if jax_results else None
+    pytorch_fwd_bwd_tput = pytorch_results.get('fwd_bwd_throughput_tokens_sec') if pytorch_results else None
+    print_comparison_row("Forward+Backward Throughput", jax_fwd_bwd_tput, pytorch_fwd_bwd_tput, "tok/s", format_throughput_comparison)
+    
+    # Component-level benchmarks
+    # Map JAX component names to PyTorch component names
+    component_mapping = [
+        ('Mlp', 'MLP', 'MLP / Mlp'),
+        ('CausalAttn', 'Attention', 'Attention / CausalAttn'),
+        ('TBlock', 'Block', 'Block / TBlock'),
     ]
     
-    for name, value in config_items:
-        print(f"│  {name:<24} {str(value):>50} │")
-    
-    print("└" + "─" * 78 + "┘")
-    
-    # Print benchmark settings
-    print("\n┌" + "─" * 78 + "┐")
-    print("│" + " BENCHMARK SETTINGS".center(78) + "│")
-    print("├" + "─" * 39 + "┬" + "─" * 38 + "┤")
-    print("│" + " JAX".center(39) + "│" + " PyTorch DDP".center(38) + "│")
-    print("├" + "─" * 39 + "┼" + "─" * 38 + "┤")
-    
-    settings = [
-        ("Batch Size", 'batch_size'),
-        ("Num Devices", 'num_devices'),
-        ("Device Type", 'device_type'),
-        ("Iterations", 'num_iterations'),
-    ]
-    
-    for name, key in settings:
-        jax_val = str(jax_results.get(key, 'N/A')) if jax_results else 'N/A'
-        pytorch_val = str(pytorch_results.get(key, 'N/A')) if pytorch_results else 'N/A'
-        # Truncate device type if too long
-        if key == 'device_type':
-            jax_val = jax_val[:35] if len(jax_val) > 35 else jax_val
-            pytorch_val = pytorch_val[:32] if len(pytorch_val) > 32 else pytorch_val
-        print(f"│  {name:<15} {jax_val:>20} │ {pytorch_val:>35} │")
-    
-    print("└" + "─" * 39 + "┴" + "─" * 38 + "┘")
-    
-    # Print timing results
-    print("\n┌" + "─" * 78 + "┐")
-    print("│" + " TIMING RESULTS (milliseconds)".center(78) + "│")
-    print("├" + "─" * 26 + "┬" + "─" * 16 + "┬" + "─" * 16 + "┬" + "─" * 17 + "┤")
-    print("│" + " Metric".center(26) + "│" + " JAX".center(16) + "│" + " PyTorch".center(16) + "│" + " Speedup".center(17) + "│")
-    print("├" + "─" * 26 + "┼" + "─" * 16 + "┼" + "─" * 16 + "┼" + "─" * 17 + "┤")
-    
-    timing_metrics = [
-        ("Forward (avg)", 'avg_forward_time_ms'),
-        ("Forward (min)", 'min_forward_time_ms'),
-        ("Forward (max)", 'max_forward_time_ms'),
-        ("Fwd+Bwd (avg)", 'avg_fwd_bwd_time_ms'),
-        ("Fwd+Bwd (min)", 'min_fwd_bwd_time_ms'),
-        ("Fwd+Bwd (max)", 'max_fwd_bwd_time_ms'),
-    ]
-    
-    for name, key in timing_metrics:
-        jax_val = jax_results.get(key, None) if jax_results else None
-        pytorch_val = pytorch_results.get(key, None) if pytorch_results else None
+    for jax_name, pytorch_name, display_name in component_mapping:
+        # Check if component results exist
+        jax_key = f'{jax_name}_avg_forward_time_ms'
+        pytorch_key = f'{pytorch_name}_avg_forward_time_ms'
         
-        jax_str = f"{jax_val:.2f}" if jax_val is not None else "N/A"
-        pytorch_str = f"{pytorch_val:.2f}" if pytorch_val is not None else "N/A"
+        jax_has_component = jax_results and jax_key in jax_results
+        pytorch_has_component = pytorch_results and pytorch_key in pytorch_results
         
-        # Calculate speedup (JAX relative to PyTorch)
-        if jax_val is not None and pytorch_val is not None and jax_val > 0:
-            speedup = pytorch_val / jax_val
-            if speedup >= 1:
-                speedup_str = f"JAX {speedup:.2f}x"
-            else:
-                speedup_str = f"PT {1/speedup:.2f}x"
-        else:
-            speedup_str = "N/A"
-        
-        print(f"│  {name:<24}│{jax_str:>15} │{pytorch_str:>15} │{speedup_str:>16} │")
+        if jax_has_component or pytorch_has_component:
+            print_section(f"Component: {display_name}")
+            print(f"  {'Metric':<40s} | {'JAX':>18s} | {'PyTorch':>18s} | Comparison")
+            print(f"  {'-'*40} | {'-'*18} | {'-'*18} | {'-'*25}")
+            
+            # Parameters
+            jax_params = jax_results.get(f'{jax_name}_num_params') if jax_results else None
+            pytorch_params = pytorch_results.get(f'{pytorch_name}_num_params') if pytorch_results else None
+            print_comparison_row("Parameters", jax_params, pytorch_params)
+            
+            # Forward time
+            jax_fwd = jax_results.get(f'{jax_name}_avg_forward_time_ms') if jax_results else None
+            pytorch_fwd = pytorch_results.get(f'{pytorch_name}_avg_forward_time_ms') if pytorch_results else None
+            print_comparison_row("Avg Forward Time", jax_fwd, pytorch_fwd, "ms", format_speedup)
+            
+            # Forward+Backward time
+            jax_fwd_bwd = jax_results.get(f'{jax_name}_avg_fwd_bwd_time_ms') if jax_results else None
+            pytorch_fwd_bwd = pytorch_results.get(f'{pytorch_name}_avg_fwd_bwd_time_ms') if pytorch_results else None
+            print_comparison_row("Avg Forward+Backward Time", jax_fwd_bwd, pytorch_fwd_bwd, "ms", format_speedup)
+            
+            # Forward throughput
+            jax_fwd_tput = jax_results.get(f'{jax_name}_forward_throughput_tokens_sec') if jax_results else None
+            pytorch_fwd_tput = pytorch_results.get(f'{pytorch_name}_forward_throughput_tokens_sec') if pytorch_results else None
+            print_comparison_row("Forward Throughput", jax_fwd_tput, pytorch_fwd_tput, "tok/s", format_throughput_comparison)
+            
+            # Forward+Backward throughput
+            jax_fwd_bwd_tput = jax_results.get(f'{jax_name}_fwd_bwd_throughput_tokens_sec') if jax_results else None
+            pytorch_fwd_bwd_tput = pytorch_results.get(f'{pytorch_name}_fwd_bwd_throughput_tokens_sec') if pytorch_results else None
+            print_comparison_row("Forward+Backward Throughput", jax_fwd_bwd_tput, pytorch_fwd_bwd_tput, "tok/s", format_throughput_comparison)
     
-    print("└" + "─" * 26 + "┴" + "─" * 16 + "┴" + "─" * 16 + "┴" + "─" * 17 + "┘")
-    
-    # Print throughput results
-    print("\n┌" + "─" * 78 + "┐")
-    print("│" + " THROUGHPUT (tokens/second)".center(78) + "│")
-    print("├" + "─" * 26 + "┬" + "─" * 16 + "┬" + "─" * 16 + "┬" + "─" * 17 + "┤")
-    print("│" + " Metric".center(26) + "│" + " JAX".center(16) + "│" + " PyTorch".center(16) + "│" + " Speedup".center(17) + "│")
-    print("├" + "─" * 26 + "┼" + "─" * 16 + "┼" + "─" * 16 + "┼" + "─" * 17 + "┤")
-    
-    throughput_metrics = [
-        ("Forward", 'forward_throughput_tokens_sec'),
-        ("Forward+Backward", 'fwd_bwd_throughput_tokens_sec'),
-    ]
-    
-    for name, key in throughput_metrics:
-        jax_val = jax_results.get(key, None) if jax_results else None
-        pytorch_val = pytorch_results.get(key, None) if pytorch_results else None
-        
-        jax_str = format_number(jax_val, 0) if jax_val is not None else "N/A"
-        pytorch_str = format_number(pytorch_val, 0) if pytorch_val is not None else "N/A"
-        
-        # Calculate speedup (higher throughput is better)
-        if jax_val is not None and pytorch_val is not None and pytorch_val > 0:
-            speedup = jax_val / pytorch_val
-            if speedup >= 1:
-                speedup_str = f"JAX {speedup:.2f}x"
-            else:
-                speedup_str = f"PT {1/speedup:.2f}x"
-        else:
-            speedup_str = "N/A"
-        
-        print(f"│  {name:<24}│{jax_str:>15} │{pytorch_str:>15} │{speedup_str:>16} │")
-    
-    print("└" + "─" * 26 + "┴" + "─" * 16 + "┴" + "─" * 16 + "┴" + "─" * 17 + "┘")
-    
-    # Print summary
-    print("\n┌" + "─" * 78 + "┐")
-    print("│" + " SUMMARY".center(78) + "│")
-    print("├" + "─" * 78 + "┤")
-    
+    # Summary
+    print_section("Summary")
     if jax_results and pytorch_results:
-        jax_fwd = jax_results.get('avg_forward_time_ms', float('inf'))
-        pytorch_fwd = pytorch_results.get('avg_forward_time_ms', float('inf'))
-        jax_fwdbwd = jax_results.get('avg_fwd_bwd_time_ms', float('inf'))
-        pytorch_fwdbwd = pytorch_results.get('avg_fwd_bwd_time_ms', float('inf'))
+        full_fwd_jax = jax_results.get('avg_forward_time_ms', 0)
+        full_fwd_pytorch = pytorch_results.get('avg_forward_time_ms', 0)
+        full_fwd_bwd_jax = jax_results.get('avg_fwd_bwd_time_ms', 0)
+        full_fwd_bwd_pytorch = pytorch_results.get('avg_fwd_bwd_time_ms', 0)
         
-        if jax_fwd < pytorch_fwd:
-            fwd_winner = f"JAX is {pytorch_fwd/jax_fwd:.2f}x faster for forward pass"
-        else:
-            fwd_winner = f"PyTorch is {jax_fwd/pytorch_fwd:.2f}x faster for forward pass"
+        if full_fwd_jax and full_fwd_pytorch:
+            if full_fwd_jax < full_fwd_pytorch:
+                print(f"  Full Model Forward: JAX is {full_fwd_pytorch/full_fwd_jax:.2f}x faster")
+            else:
+                print(f"  Full Model Forward: PyTorch is {full_fwd_jax/full_fwd_pytorch:.2f}x faster")
         
-        if jax_fwdbwd < pytorch_fwdbwd:
-            fwdbwd_winner = f"JAX is {pytorch_fwdbwd/jax_fwdbwd:.2f}x faster for forward+backward"
-        else:
-            fwdbwd_winner = f"PyTorch is {jax_fwdbwd/pytorch_fwdbwd:.2f}x faster for forward+backward"
+        if full_fwd_bwd_jax and full_fwd_bwd_pytorch:
+            if full_fwd_bwd_jax < full_fwd_bwd_pytorch:
+                print(f"  Full Model Forward+Backward: JAX is {full_fwd_bwd_pytorch/full_fwd_bwd_jax:.2f}x faster")
+            else:
+                print(f"  Full Model Forward+Backward: PyTorch is {full_fwd_bwd_jax/full_fwd_bwd_pytorch:.2f}x faster")
         
-        print(f"│  • {fwd_winner:<73} │")
-        print(f"│  • {fwdbwd_winner:<73} │")
-    else:
-        print("│  • Cannot compare - missing benchmark results.".ljust(77) + " │")
+        # Component summaries
+        print("\n  Component-level summary:")
+        for jax_name, pytorch_name, display_name in component_mapping:
+            jax_fwd = jax_results.get(f'{jax_name}_avg_forward_time_ms')
+            pytorch_fwd = pytorch_results.get(f'{pytorch_name}_avg_forward_time_ms')
+            
+            if jax_fwd and pytorch_fwd:
+                if jax_fwd < pytorch_fwd:
+                    print(f"    {display_name:30s} Forward: JAX is {pytorch_fwd/jax_fwd:.2f}x faster")
+                else:
+                    print(f"    {display_name:30s} Forward: PyTorch is {jax_fwd/pytorch_fwd:.2f}x faster")
     
-    print("└" + "─" * 78 + "┘")
-    print()
+    print("\n" + "="*90 + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Compare JAX and PyTorch benchmark results')
     parser.add_argument('--jax', type=str, default='jax_benchmark_results.csv',
-                        help='Path to JAX benchmark results CSV')
+                       help='JAX benchmark results CSV file')
     parser.add_argument('--pytorch', type=str, default='pytorch_benchmark_results.csv',
-                        help='Path to PyTorch benchmark results CSV')
+                       help='PyTorch benchmark results CSV file')
     
     args = parser.parse_args()
-    
-    # Read results
-    jax_results = read_csv_results(args.jax)
-    pytorch_results = read_csv_results(args.pytorch)
-    
-    # Print comparison
-    print_comparison_table(jax_results, pytorch_results)
+    compare_results(args.jax, args.pytorch)
 
 
 if __name__ == '__main__':
