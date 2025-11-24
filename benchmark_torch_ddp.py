@@ -24,8 +24,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
-# ============== Model Definition (from provided code) ==============
-
 @dataclass
 class ModelConfig:
     model_dim: int
@@ -275,7 +273,9 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
     # Initialize model
     model = Transformer(cfg)
     model = model.to(device)
-    model = torch.compile(model, fullgraph=True, mode='max-autotune', dynamic=False)
+    # TODO(rka97): make this an option
+    #model = torch.compile(model, fullgraph=True, mode='max-autotune', dynamic=False)
+    model = torch.compile(model, fullgraph=True)
     
     # Count parameters before wrapping with DDP
     param_count = sum(p.numel() for p in model.parameters())

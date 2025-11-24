@@ -21,8 +21,6 @@ from flax.training import train_state
 import optax
 
 
-# ============== Model Definition (from provided code) ==============
-
 @dataclasses.dataclass
 class ModelConfig:
     """Hyper-parameters for Transformer decoder-only."""
