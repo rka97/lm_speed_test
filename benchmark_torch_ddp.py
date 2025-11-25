@@ -37,14 +37,15 @@ class ModelConfig:
     qknorm_epsilon: float = 1e-6
     use_residual_scaling: bool = True
     tie_embeddings: bool = True
+    dtype: torch.dtype = torch.bfloat16
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, multiple_of: int = 256):
+    def __init__(self, dim: int, hidden_dim: int, multiple_of: int = 256, dtype: torch.dtype = torch.float32):
         super().__init__()
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        self.fc1 = nn.Linear(dim, 2 * hidden_dim, bias=False)
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.fc1 = nn.Linear(dim, 2 * hidden_dim, bias=False, dtype=dtype)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False, dtype=dtype)
         self.glu = nn.GLU(dim=-1)
         nn.init.normal_(self.fc1.weight, std=0.02)
         nn.init.normal_(self.fc2.weight, std=0.02)
@@ -87,8 +88,8 @@ class Attention(nn.Module):
         self.head_dim = cfg.model_dim // cfg.num_heads
         self.seq_len = cfg.seq_len
 
-        self.w_qkv = nn.Linear(cfg.model_dim, 3 * cfg.model_dim, bias=False)
-        self.w_out = nn.Linear(cfg.model_dim, cfg.model_dim, bias=False)
+        self.w_qkv = nn.Linear(cfg.model_dim, 3 * cfg.model_dim, bias=False, dtype=cfg.dtype)
+        self.w_out = nn.Linear(cfg.model_dim, cfg.model_dim, bias=False, dtype=cfg.dtype)
         wq, wk, wv = torch.chunk(self.w_qkv.weight, 3, dim=0)
         for w in [wq, wk, wv]:
             nn.init.normal_(w, std=0.02)
@@ -97,7 +98,7 @@ class Attention(nn.Module):
         self.eps = cfg.qknorm_epsilon
         seq_len = cfg.seq_len
         attn_scale0 = math.log2(seq_len**2 - seq_len)
-        self.attn_scale = nn.Parameter(torch.tensor(attn_scale0))
+        self.attn_scale = nn.Parameter(torch.tensor(attn_scale0, dtype=cfg.dtype))
         
         # Pre-compute freqs_cis for standalone usage
         self.register_buffer(
@@ -138,13 +139,14 @@ class Block(nn.Module):
     def __init__(self, layer_id: int, cfg: ModelConfig):
         super().__init__()
         self.attn = Attention(cfg)
-        self.attn_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon)
+        self.attn_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon, dtype=cfg.dtype)
         self.mlp = MLP(
             dim=cfg.model_dim,
             hidden_dim=cfg.expanded_model_dim,
             multiple_of=cfg.multiple_of,
+            dtype=cfg.dtype,
         )
-        self.mlp_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon)
+        self.mlp_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon, dtype=cfg.dtype)
         self.layer_id = layer_id
 
     def forward(self, x, freqs_cis=None):
@@ -163,8 +165,8 @@ class Transformer(nn.Module):
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.model_dim)
         self.layers = nn.ModuleList([Block(idx, cfg) for idx in range(cfg.num_layers)])
-        self.out_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon)
-        self.lm_head = nn.Linear(cfg.model_dim, cfg.vocab_size, bias=False)
+        self.out_norm = nn.RMSNorm(cfg.model_dim, eps=cfg.rmsnorm_epsilon, dtype=cfg.dtype)
+        self.lm_head = nn.Linear(cfg.model_dim, cfg.vocab_size, bias=False, dtype=cfg.dtype)
 
         self.register_buffer(
             'freqs_cis',
@@ -258,6 +260,8 @@ def benchmark_component(component_name: str, model: nn.Module, cfg: ModelConfig,
         print(f"\n--- {component_name} Benchmark ---")
     
     model = model.to(device)
+    if cfg.dtype == torch.bfloat16:
+        model = model.bfloat16()
     #model = torch.compile(model, fullgraph=True, mode='max-autotune', dynamic=False)
     model = torch.compile(model, fullgraph=True)
     
@@ -276,7 +280,7 @@ def benchmark_component(component_name: str, model: nn.Module, cfg: ModelConfig,
     
     # Generate synthetic data (float input for components)
     torch.manual_seed(456 + local_rank)
-    batch = torch.randn(batch_size, cfg.seq_len, cfg.model_dim, device=device)
+    batch = torch.randn(batch_size, cfg.seq_len, cfg.model_dim, device=device, dtype=cfg.dtype)
     
     # ============== Forward-only benchmark ==============
     model.eval()
@@ -408,6 +412,8 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
     # Initialize model
     model = Transformer(cfg)
     model = model.to(device)
+    if cfg.dtype == torch.bfloat16:
+        model = model.bfloat16()
     # TODO(rka97): make this an option
     #model = torch.compile(model, fullgraph=True, mode='max-autotune', dynamic=False)
     model = torch.compile(model, fullgraph=True)
@@ -536,6 +542,7 @@ def run_benchmark(cfg, batch_size, num_warmup, num_iterations, output_file):
         dim=cfg.model_dim,
         hidden_dim=cfg.expanded_model_dim,
         multiple_of=cfg.multiple_of,
+        dtype=cfg.dtype,
     )
     mlp_results = benchmark_component('MLP', mlp_model, cfg, batch_size, num_warmup,
                                       num_iterations, device, world_size, local_rank, is_main)

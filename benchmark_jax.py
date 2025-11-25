@@ -35,7 +35,7 @@ class ModelConfig:
     use_residual_scaling: bool = True
     tie_embeddings: bool = True
     qknorm_epsilon: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
     attention_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
     linear_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
     embed_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
@@ -90,7 +90,7 @@ def init_rope(dim=256, seq_len=128, n_heads=4):
 def apply_rope(q, k, freqs_cis):
     """Apply rotary embeddings to Q and K."""
     def rotate_tensor(x):
-        x_r2 = x.reshape(*x.shape[:-1], -1, 2)
+        x_r2 = x.reshape(*x.shape[:-1], -1, 2).astype(jnp.float32)
         L = x.shape[1]
         freqs = freqs_cis[:, :L, :, :, :]
         rotated_x_r2 = jnp.stack(
@@ -100,7 +100,7 @@ def apply_rope(q, k, freqs_cis):
             ],
             axis=-1,
         )
-        return rotated_x_r2.reshape(*x.shape)
+        return rotated_x_r2.reshape(*x.shape).astype(x.dtype)
     rotated_q = rotate_tensor(q)
     rotated_k = rotate_tensor(k)
     return rotated_q, rotated_k
@@ -124,12 +124,12 @@ class CausalAttn(nn.Module):
             use_bias=False,
             dtype=cfg.dtype,
         )
-        self.multilinear_query = self.multilinear(name='query')
-        self.multilinear_key = self.multilinear(name='key')
-        self.multilinear_value = self.multilinear(name='value')
+        self.multilinear_query = self.multilinear(name='query', dtype=cfg.dtype)
+        self.multilinear_key = self.multilinear(name='key', dtype=cfg.dtype)
+        self.multilinear_value = self.multilinear(name='value', dtype=cfg.dtype)
         seq_len = cfg.seq_len
         attn_scale0 = jnp.log2(seq_len**2 - seq_len)
-        self.attn_scale = self.param('attn_scale', nn.initializers.constant(attn_scale0), ())
+        self.attn_scale = self.param('attn_scale', nn.initializers.constant(attn_scale0, dtype=cfg.dtype), ())
         self.output_projection = nn.DenseGeneral(
             features=cfg.model_dim,
             name='attn_out_proj',
@@ -146,15 +146,13 @@ class CausalAttn(nn.Module):
         q_BxLxHxDh, k_BxLxHxDh = apply_rope(q_BxLxHxDh, k_BxLxHxDh, self.freqs_cis)
         q_BxLxHxDh /= jnp.linalg.norm(q_BxLxHxDh, axis=-1, keepdims=True) + self.eps
         k_BxLxHxDh /= jnp.linalg.norm(k_BxLxHxDh, axis=-1, keepdims=True) + self.eps
-        att_BxHxLxL = jnp.einsum('...qhd,...khd->...hqk', q_BxLxHxDh, k_BxLxHxDh)
-        L = x_BxLxD.shape[1]
-        mask_1x1xLxL = jnp.tril(jnp.ones((1, 1, L, L), dtype=jnp.bool_))
-        _NEG_INF = jnp.finfo(cfg.dtype).min
-        att_BxHxLxL = jnp.where(mask_1x1xLxL, att_BxHxLxL, _NEG_INF)
-        att_BxHxLxL = self.attn_scale * att_BxHxLxL
-        att_BxHxLxL = jax.nn.softmax(att_BxHxLxL, axis=-1)
-        att_BxHxLxL = att_BxHxLxL.astype(cfg.dtype)
-        out_BxLxHxDh = jnp.einsum('...hqk,...khd->...qhd', att_BxHxLxL, v_BxLxHxDh)
+        q_BxLxHxDh *= self.attn_scale
+        out_BxLxHxDh = jax.nn.dot_product_attention(query=q_BxLxHxDh,
+                                                   key=k_BxLxHxDh,
+                                                   value=v_BxLxHxDh,
+                                                   is_causal=True,
+                                                   scale=1.0,
+                                                   implementation='cudnn' if cfg.dtype == jnp.float16 or cfg.dtype == jnp.bfloat16 else None)
         out_BxLxD = out_BxLxHxDh.reshape(*x_BxLxD.shape)
         out_BxLxD = self.output_projection(out_BxLxD)
         return out_BxLxD
@@ -185,11 +183,13 @@ class TransformerDo(nn.Module):
             num_embeddings=cfg.vocab_size,
             features=cfg.model_dim,
             embedding_init=cfg.embed_init,
+            dtype=cfg.dtype,
+            param_dtype=cfg.dtype,
         )
         self.blocks = [TBlock(cfg) for _ in range(cfg.num_layers)]
         self.out_ln = nn.RMSNorm(param_dtype=cfg.dtype, epsilon=cfg.rmsnorm_epsilon)
         if cfg.tie_embeddings:
-            self.output_proj = lambda x: self.embed.attend(x.astype(jnp.float32))
+            self.output_proj = lambda x: self.embed.attend(x)
         else:
             self.output_proj = nn.Dense(
                 cfg.vocab_size,
